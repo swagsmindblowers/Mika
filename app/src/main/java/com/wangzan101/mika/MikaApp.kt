@@ -507,6 +507,8 @@ class MikaApp : Application(), WebOwner, SandboxOwner, TaskEnvironment.Owner, Ph
     override fun onCreate() {
         super.onCreate()
         com.wangzan101.mika.core.tool.ToolApproval.gate = toolApproval
+        // Jarvis 常驻:Mika 一启动就在后台听唤醒词(后台拉起进程时安卓不允许,静默跳过)
+        com.wangzan101.mika.driving.DrivingService.startIfAlwaysOn(this)
         // 上次进程在复制或绑定分享草稿途中退出时留下的临时文件;目录至多保留一份有效草稿。
         runCatching { sharedDrafts.cleanup() }
         scope.launch(Dispatchers.IO) {

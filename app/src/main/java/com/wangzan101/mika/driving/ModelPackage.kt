@@ -156,9 +156,10 @@ internal class ModelPackage(
                 if (name.isEmpty() || !entry.isDirectory && !entry.isFile) continue
                 val target = File(base, name).canonicalFile
                 if (target != base && !target.path.startsWith(base.path + File.separator)) throw IOException("unsafe path in archive: ${entry.name}")
+                if (!keep(name.trimEnd('/'))) continue
                 if (entry.isDirectory) {
                     target.mkdirs()
-                } else if (keep(name)) {
+                } else {
                     target.parentFile?.mkdirs()
                     target.outputStream().use { tar.copyTo(it) }
                 }

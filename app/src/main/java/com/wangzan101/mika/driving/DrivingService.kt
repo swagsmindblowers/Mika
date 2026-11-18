@@ -58,7 +58,7 @@ class DrivingService : LifecycleService() {
         try {
             ServiceCompat.startForeground(
                 this, DrivingNotifications.ID_SERVICE,
-                DrivingNotifications.service(this, "Say \"Jarvis\" or tap SPEAK", stop),
+                DrivingNotifications.service(this, "Listening for \"Hey Jarvis\"", stop),
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
             )
         } catch (e: Exception) {
@@ -70,7 +70,8 @@ class DrivingService : LifecycleService() {
         }
         running = true
         tts = JarvisTTS(this)
-        JarvisModel.ensure(this)
+        JarvisModel.ensure(this) // Piper:既是选项,也是 Kokoro 太慢时的退路
+        if (DrivingPrefs.get(this).voiceEngine == VoiceEngine.Kokoro) KokoroModel.ensure(this)
         if (DrivingPrefs.get(this).wakeWordEnabled) {
             WakeWordModel.ensure(this)
             val manager = WakeWordManager(this).also { wake = it }
@@ -79,6 +80,7 @@ class DrivingService : LifecycleService() {
                 WakeWordModel.status.first { WakeWordModel.isReady(this@DrivingService) }
                 if (!manager.start()) Log.w(TAG, "wake word off: ${manager.error.value}")
             }
+            lifecycleScope.launch { manager.error.collect { _wakeError.value = it } }
             lifecycleScope.launch {
                 manager.detections.collect {
                     if (_state.value == DrivingState.IDLE) startTurn() else manager.resume()
@@ -104,6 +106,8 @@ class DrivingService : LifecycleService() {
 
     override fun onDestroy() {
         running = false
+        driving = false
+        _wakeError.value = null
         turn?.cancel()
         wake?.stop()
         if (::tts.isInitialized) tts.shutdown()
@@ -238,7 +242,7 @@ class DrivingService : LifecycleService() {
             ?: app.conversations.newConversation().also { conversationId = it }
         val tasks = app.taskState
         var seen: TaskState = tasks.state.value
-        TaskService.start(app, "$DRIVING_PREAMBLE\n\n$spoken", id)
+        TaskService.start(app, "${if (driving) DRIVING_PREAMBLE else VOICE_PREAMBLE}\n\n$spoken", id)
         while (true) {
             val state = withTimeoutOrNull(TASK_TIMEOUT_MS) {
                 combine(tasks.state, tasks.conversationId) { s, c -> s to c }
@@ -321,7 +325,12 @@ class DrivingService : LifecycleService() {
         private const val TASK_TIMEOUT_MS = 3 * 60_000L
         private const val CONVERSATION_IDLE_MS = 10 * 60_000L
 
-        /** 写在话前面,让 Mika 知道用户在开车、回答是用耳朵听的。 */
+        /** 常驻听唤醒词、不是在开车时写在话前面的提示:回答要说出来,所以要短、纯文字。 */
+        private const val VOICE_PREAMBLE =
+            "[Voice assistant: the user spoke this request and hears your reply read aloud. " +
+                "Answer in one to three short spoken sentences, plain text only, no lists or markdown.]"
+
+        /** 开车时写在话前面,让 Mika 知道用户在开车、回答是用耳朵听的。 */
         private const val DRIVING_PREAMBLE =
             "[Driving mode: the user is driving and hears your reply through the car speakers. " +
                 "Answer in one to three short spoken sentences, plain text only, no lists or markdown. " +
@@ -339,29 +348,55 @@ class DrivingService : LifecycleService() {
         /** Jarvis 的回答;朗读时随每一句开始播而增长。 */
         val response: StateFlow<String> = _response.asStateFlow()
 
-        @Volatile
-        private var running = false
+        private val _running = MutableStateFlow(false)
+        private var running: Boolean
+            get() = _running.value
+            set(v) { _running.value = v }
 
         /** 服务是否在运行(界面据此决定要不要先起服务)。 */
         val isRunning: Boolean get() = running
+
+        /** 同上,给界面观察。 */
+        val runningFlow: StateFlow<Boolean> = _running.asStateFlow()
+
+        private val _wakeError = MutableStateFlow<String?>(null)
+        /** 唤醒词起不来的原因(模型没下好、没权限……);正常或没开唤醒词时为 null。 */
+        val wakeError: StateFlow<String?> = _wakeError.asStateFlow()
 
         /**
          * 起服务。没有录音权限时不起(麦克风类型的前台服务没权限会直接抛异常),改发通知请用户去授权;
          * 系统不让后台起时改发「点一下开始」的通知。
          */
-        fun start(context: Context, action: String? = null) {
+        fun start(context: Context, action: String? = null, prompt: Boolean = true) {
             val app = context.applicationContext
             if (app.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-                DrivingNotifications.promptSettings(app, "Jarvis needs microphone permission. Tap to grant it.")
+                if (prompt) DrivingNotifications.promptSettings(app, "Jarvis needs microphone permission. Tap to grant it.")
                 return
             }
             try {
                 ContextCompat.startForegroundService(app, Intent(app, DrivingService::class.java).setAction(action))
             } catch (e: Exception) {
                 Log.w(TAG, "cannot start from background", e)
-                DrivingNotifications.promptOpenDriving(app)
+                if (prompt) DrivingNotifications.promptOpenDriving(app)
             }
         }
+
+        /**
+         * 「常驻」打开时,Mika 进程一起来就让 Jarvis 在后台听(MikaApp.onCreate 调)。
+         * 进程可能是被开机广播等后台事件拉起来的,那时安卓不让起麦克风前台服务:静默失败,不发通知(开机另有提示)。
+         */
+        fun startIfAlwaysOn(context: Context) {
+            val app = context.applicationContext
+            if (running || !DrivingPrefs.get(app).alwaysOn) return
+            start(app, prompt = false)
+        }
+
+        /**
+         * 此刻是不是真的在开车(打开了驾驶界面,或车载蓝牙触发):只影响写给 Mika 的提示语,
+         * 开车时要求回答简短、不做要看屏幕的事;平时常驻听唤醒词时不加这个限制。
+         */
+        @Volatile
+        var driving: Boolean = false
 
         fun stop(context: Context) {
             context.applicationContext.stopService(Intent(context.applicationContext, DrivingService::class.java))

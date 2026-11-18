@@ -82,10 +82,37 @@ Two things you will notice:
   `auto` and `radio` match names such as "Carrie's AirPods". Turn off "Any Bluetooth audio device counts" to rely on
   names only.
 
-## 4. Adjusting the voice speed
+## 4. Voice and speed
 
-`JarvisTTS.DEFAULT_SPEED = 0.92f` in `driving/JarvisTTS.kt`. `1.0f` is the model's natural speed, lower is slower.
-It is also a runtime property (`tts.speed`) and is applied to the fallback voice too.
+Two offline voices, chosen on the **Jarvis Driving** screen:
+- **Natural (Kokoro, default):** `bm_george`, a British male voice from Kokoro-82M (int8, about 132 MB download, about
+  170 MB on disk). Far more natural than Piper, but it is heavy. On a desktop CPU it synthesizes at roughly real time, so
+  on a phone it may be slower than playback.
+- **Fast (Piper):** `en_GB-alan-medium`, about 67 MB, about 20x faster than real time on a desktop CPU, flatter sounding.
+
+Both download on first use (Wi-Fi only by default). Piper is always downloaded too because it is the safety net: if
+Kokoro cannot keep up (two sentences in a row that take more than 1.1x their audio length to generate), Jarvis switches
+to Piper automatically and remembers it. Tap **Natural** again on the settings screen to retry. If neither voice is
+installed yet, Android's built-in voice speaks.
+
+The speed slider (0.7x to 1.6x) is separate per voice (Kokoro default 1.0, Piper default 1.15 because Alan is slow at 1.0).
+**Test voice** speaks a sample at the current setting. Other British male Kokoro speakers: change
+`KokoroModel.SPEAKER_ID` (24 `bm_daniel`, 25 `bm_fable`, 26 `bm_george`, 27 `bm_lewis`).
+
+If answers feel slow, most of the delay is usually Mika's own task running, not the voice.
+
+## 5. Always listening (not just in driving mode)
+
+The wake word runs inside `DrivingService`. With **Listen for "Hey Jarvis" in the background** on (default), the service
+starts whenever Mika's process starts, so you do not need to open driving mode. When it is not in driving mode the
+prompt sent to Mika does not include the "keep it short, no screen work" driving instructions beyond asking for a short
+spoken answer.
+
+- **After a reboot** Android does not allow a background app to start a microphone service, so you get a notification:
+  tap it to resume. Opening Mika also resumes it.
+- It keeps a persistent notification and the microphone open: expect extra battery use.
+- Some phones' battery savers kill background services; exempt Mika from battery optimisation if it stops listening.
+- Turn it off with the same switch (also stops the service now).
 
 ## Android Auto
 
@@ -116,12 +143,14 @@ Limitations you should know about:
 |---|---|
 | `WakeWordManager.kt` | sherpa-onnx keyword spotter on a dedicated thread; `start/stop/pause/resume`; `detections` Flow |
 | `WakeWordModel.kt`, `ModelPackage.kt` | Wake word model definition; shared model download/unpack code |
-| `JarvisTTS.kt` | sherpa-onnx Piper voice, sentence pipeline, `AudioTrack` playback, Android TTS fallback |
+| `JarvisTTS.kt` | sherpa-onnx Kokoro/Piper voices, sentence pipeline, auto-fallback, `AudioTrack` playback, Android TTS fallback |
+| `KokoroModel.kt` | Kokoro voice package definition |
 | `JarvisModel.kt` | Voice model definition (download handled by `ModelPackage`) |
 | `SentenceSplitter.kt` | Strips Markdown, splits an answer into short spoken sentences |
 | `DrivingService.kt` | Foreground service (microphone), state machine, STT → Mika task → TTS |
 | `DrivingActivity.kt`, `DrivingScreen.kt` | Full-screen Compose UI |
-| `DrivingSettingsActivity.kt` | Launcher entry: permissions, toggles, test buttons |
+| `DrivingSettingsActivity.kt` | Launcher entry: permissions, toggles, voice speed, test buttons |
+| `JarvisBoot.kt` | Boot notification and the no-UI trampoline that resumes listening |
 | `BluetoothTrigger.kt` | `ACL_CONNECTED` receiver |
 | `JarvisCarAppService.kt` | Android Auto service and `MainCarScreen` |
 | `DrivingState.kt`, `DrivingNotifications.kt` | State enum and prefs; notifications |

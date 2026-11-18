@@ -17,6 +17,7 @@ class DrivingActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        DrivingService.driving = true
         setContent {
             DrivingScreen(
                 onSpeak = { DrivingService.send(this, DrivingService.ACTION_START_LISTENING) },
@@ -34,5 +35,11 @@ class DrivingActivity : ComponentActivity() {
                 micPermission.launch(Manifest.permission.RECORD_AUDIO)
             }
         }
+    }
+
+    override fun onDestroy() {
+        // 换方向等重建不会走到这里(竖屏锁定);真的离开了才不算在开车
+        if (isFinishing) DrivingService.driving = false
+        super.onDestroy()
     }
 }

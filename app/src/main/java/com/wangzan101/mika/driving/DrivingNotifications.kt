@@ -50,6 +50,17 @@ internal object DrivingNotifications {
         post(context, text, openDriving(context))
     }
 
+    /** 开机后恢复常驻的提示:点一下经 [JarvisStartActivity] 起服务,不打开驾驶界面。 */
+    fun promptResume(context: Context) {
+        post(
+            context, "Tap to resume listening for \"Hey Jarvis\"",
+            PendingIntent.getActivity(
+                context, 2, Intent(context, JarvisStartActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            ),
+        )
+    }
+
     fun promptSettings(context: Context, text: String) {
         post(context, text, openSettings(context))
     }

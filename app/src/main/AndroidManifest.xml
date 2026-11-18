@@ -431,6 +431,21 @@
             android:turnScreenOn="true"
             android:theme="@android:style/Theme.Material.NoActionBar" />
 
+        <!-- 没有界面的跳板:开机通知点进来,在前台起 Jarvis 服务 -->
+        <activity
+            android:name=".driving.JarvisStartActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.NoDisplay" />
+
+        <receiver android:name=".driving.JarvisBootReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
         <service
             android:name=".driving.DrivingService"
             android:exported="false"

@@ -11,8 +11,10 @@ import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import com.k2fsa.sherpa.onnx.OfflineTts
 import com.k2fsa.sherpa.onnx.OfflineTtsConfig
+import com.k2fsa.sherpa.onnx.OfflineTtsKokoroModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig
+import android.os.SystemClock
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -35,12 +37,12 @@ import kotlin.coroutines.coroutineContext
 import kotlin.coroutines.resume
 
 /**
- * 离线的 Jarvis 声音:sherpa-onnx + Piper 英式男声(en_GB-alan-medium),模型见 [JarvisModel]。
+ * 离线的 Jarvis 声音:sherpa-onnx,Kokoro 或 Piper 英式男声(en_GB-alan-medium),模型见 [KokoroModel]、[JarvisModel]。
  *
  * 一句话一次 `generate()`,按先后进队列:第一句在播的时候,下一句已经在后台合成(流水线),缩短句间停顿。
  * 模型还没下好、或引擎起不来时,退回安卓自带的 TextToSpeech,朗读不会因此哑掉。
  *
- * 语速:改 [DEFAULT_SPEED](1.0 是原速,小于 1 更慢)。
+ * 声音:默认 Kokoro(bm_george,自然但算得慢),手机跑不过时自动退回 Piper(见 [watchKokoroSpeed]);语速在「Jarvis Driving」页里调。
  */
 class JarvisTTS(
     context: Context,
@@ -49,8 +51,9 @@ class JarvisTTS(
 ) {
     private val app = context.applicationContext
 
+    /** 语速。每次开口前按设置里的值刷新(见 [DrivingPrefs.voiceSpeed]);也可以直接改。 */
     @Volatile
-    var speed: Float = DEFAULT_SPEED
+    var speed: Float = DrivingPrefs.get(context).voiceSpeed
 
     private class Item(val text: String, val isFinal: Boolean, val onStart: (() -> Unit)?) {
         val done = CompletableDeferred<Boolean>()
@@ -75,8 +78,13 @@ class JarvisTTS(
     private var session: Session? = null
 
     private val engineLock = Any()
-    private var engine: OfflineTts? = null
-    private var engineFailed = false
+    private var piper: OfflineTts? = null
+    private var piperFailed = false
+    private var kokoro: OfflineTts? = null
+    private var kokoroFailed = false
+    /** Kokoro 已经出过几句(第一句含加载后的热身,不计入速度判断)和连续几句跑不过播放。 */
+    private var kokoroClips = 0
+    private var slowStreak = 0
 
     @Volatile
     private var track: AudioTrack? = null
@@ -86,6 +94,7 @@ class JarvisTTS(
 
     /** 排进朗读队列并立刻返回;结果为 true = 这一句播完了,false = 被 [stop] 打断。[onStart] 在这一句开始播时调。 */
     fun enqueue(text: String, isFinal: Boolean = false, onStart: (() -> Unit)? = null): Deferred<Boolean> {
+        speed = DrivingPrefs.get(app).speedFor(VoiceEngine.Piper) // 只给系统朗读的退路用;sherpa 的声音按各自的语速
         val item = Item(SentenceSplitter.clean(text), isFinal, onStart)
         if (item.text.isEmpty()) {
             if (isFinal) onSpeakingDone()
@@ -120,8 +129,10 @@ class JarvisTTS(
         // 合成可能还在原生层:等它放开锁再释放
         Thread {
             synchronized(engineLock) {
-                engine?.release()
-                engine = null
+                piper?.release()
+                piper = null
+                kokoro?.release()
+                kokoro = null
             }
         }.start()
         fallback?.shutdown()
@@ -144,19 +155,49 @@ class JarvisTTS(
     // ---- 合成 ----
 
     private fun generate(item: Item): Clip {
+        val prefs = DrivingPrefs.get(app)
         val audio = runCatching {
             synchronized(engineLock) {
-                val tts = engine() ?: return@runCatching null
-                tts.generate(text = item.text, sid = 0, speed = speed)
+                val (kind, tts) = pickEngine(prefs) ?: return@runCatching null
+                val started = SystemClock.elapsedRealtime()
+                val out = tts.generate(
+                    text = item.text,
+                    sid = if (kind == VoiceEngine.Kokoro) KokoroModel.SPEAKER_ID else 0,
+                    speed = prefs.speedFor(kind),
+                )
+                if (kind == VoiceEngine.Kokoro) watchKokoroSpeed(prefs, out.samples.size.toFloat() / out.sampleRate, SystemClock.elapsedRealtime() - started)
+                out
             }
         }.onFailure { Log.w(TAG, "generate failed, using fallback voice", it) }.getOrNull()
         return if (audio != null && audio.samples.isNotEmpty()) Clip.Audio(item, audio.samples, audio.sampleRate) else Clip.Fallback(item)
     }
 
-    /** 调用方持有 [engineLock]。模型没下好返回 null;起不来记一次,不反复重试。 */
-    private fun engine(): OfflineTts? {
-        engine?.let { return it }
-        if (engineFailed || !JarvisModel.isReady(app)) return null
+    /**
+     * Kokoro 算得比播放慢,句子之间就会断断续续。第一句不算(刚加载完),之后连续两句(音频至少 1.5 秒)
+     * 合成用时超过 [SLOW_RTF] 倍音频时长,就记下「太慢」,往后用 Piper;设置里重新选 Kokoro 会再试。
+     */
+    private fun watchKokoroSpeed(prefs: DrivingPrefs, audioSeconds: Float, tookMs: Long) {
+        if (++kokoroClips == 1 || audioSeconds < 1.5f) return
+        val rtf = tookMs / 1000f / audioSeconds
+        slowStreak = if (rtf > SLOW_RTF) slowStreak + 1 else 0
+        Log.d(TAG, "kokoro rtf=%.2f".format(rtf))
+        if (slowStreak >= 2) {
+            Log.w(TAG, "Kokoro is too slow on this phone (rtf=%.2f); switching to Piper".format(rtf))
+            prefs.kokoroTooSlow = true
+        }
+    }
+
+    /** 调用方持有 [engineLock]。选中且可用的 Kokoro 优先;其次 Piper;都没有返回 null(退回系统朗读)。 */
+    private fun pickEngine(prefs: DrivingPrefs): Pair<VoiceEngine, OfflineTts>? {
+        if (prefs.voiceEngine == VoiceEngine.Kokoro && !prefs.kokoroTooSlow) kokoro()?.let { return VoiceEngine.Kokoro to it }
+        return piper()?.let { VoiceEngine.Piper to it }
+    }
+
+    private fun threads() = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
+
+    private fun piper(): OfflineTts? {
+        piper?.let { return it }
+        if (piperFailed || !JarvisModel.isReady(app)) return null
         val dir = JarvisModel.dir(app)
         val vits = OfflineTtsVitsModelConfig(
             model = File(dir, JarvisModel.ONNX).path,
@@ -168,14 +209,36 @@ class JarvisTTS(
             noiseScaleW = 0.8f,
             lengthScale = 1.0f,
         )
-        val config = OfflineTtsConfig(model = OfflineTtsModelConfig(vits = vits, numThreads = 2, debug = false, provider = "cpu"))
-        return try {
-            OfflineTts(config = config).also { engine = it }
-        } catch (e: Throwable) {
-            Log.w(TAG, "sherpa-onnx init failed", e)
-            engineFailed = true
-            null
-        }
+        return create("Piper", OfflineTtsConfig(model = OfflineTtsModelConfig(vits = vits, numThreads = 2, debug = false, provider = "cpu"))) {
+            piperFailed = true
+        }?.also { piper = it }
+    }
+
+    private fun kokoro(): OfflineTts? {
+        kokoro?.let { return it }
+        if (kokoroFailed || !KokoroModel.isReady(app)) return null
+        val dir = KokoroModel.dir(app)
+        val config = OfflineTtsConfig(
+            model = OfflineTtsModelConfig(
+                kokoro = OfflineTtsKokoroModelConfig(
+                    model = File(dir, KokoroModel.MODEL).path,
+                    voices = File(dir, KokoroModel.VOICES).path,
+                    tokens = File(dir, KokoroModel.TOKENS).path,
+                    dataDir = File(dir, KokoroModel.ESPEAK_DIR).path,
+                    lexicon = File(dir, KokoroModel.LEXICON).path,
+                ),
+                numThreads = threads(), debug = false, provider = "cpu",
+            ),
+        )
+        return create("Kokoro", config) { kokoroFailed = true }?.also { kokoro = it }
+    }
+
+    private fun create(name: String, config: OfflineTtsConfig, onFail: () -> Unit): OfflineTts? = try {
+        OfflineTts(config = config)
+    } catch (e: Throwable) {
+        Log.w(TAG, "$name init failed", e)
+        onFail()
+        null
     }
 
     // ---- 播放 ----
@@ -291,8 +354,14 @@ class JarvisTTS(
     companion object {
         private const val TAG = "JarvisTTS"
 
-        /** 默认语速:略慢于原速,更像管家。想快点改成 1.0f。 */
-        const val DEFAULT_SPEED = 0.92f
+        /** 默认语速。这个声音原速偏慢,稍微加快听着更自然;设置页里可以调。 */
+        const val DEFAULT_SPEED = 1.15f
+        /** Kokoro 原速就自然,不用加快。 */
+        const val DEFAULT_KOKORO_SPEED = 1.0f
+        /** 合成用时 / 音频时长超过它就算跑不过播放。 */
+        private const val SLOW_RTF = 1.1f
+        const val MIN_SPEED = 0.7f
+        const val MAX_SPEED = 1.6f
 
         private const val CHUNK = 4096
 

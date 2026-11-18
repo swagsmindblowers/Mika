@@ -65,6 +65,7 @@ class BluetoothTrigger : BroadcastReceiver() {
         /** 进入驾驶模式(真连上车机和设置页的「模拟」按钮共用)。 */
         fun fire(context: Context) {
             val app = context.applicationContext
+            DrivingService.driving = true
             DrivingService.start(app)
             if (Settings.canDrawOverlays(app)) {
                 try {
